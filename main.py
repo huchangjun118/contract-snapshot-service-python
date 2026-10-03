@@ -1,7 +1,11 @@
 import uvicorn
 from fastapi import FastAPI
 
-app = FastAPI()
+from contract_snapshot.api import router as contracts_router
+
+app = FastAPI(title="Contract Snapshot Service")
+
+app.include_router(contracts_router)
 
 
 @app.get("/")
