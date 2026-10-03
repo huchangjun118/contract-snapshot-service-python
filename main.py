@@ -1,7 +1,15 @@
-import uvicorn
-from fastapi import FastAPI
+import os
 
-app = FastAPI()
+import uvicorn
+
+from contract_snapshot.api import create_app
+from contract_snapshot.config import CaptureConfig
+from contract_snapshot.service import ContractService
+from contract_snapshot.store import SnapshotStore
+
+store = SnapshotStore(os.environ.get("CONTRACT_SNAPSHOT_DB", ":memory:"))
+service = ContractService(store, CaptureConfig())
+app = create_app(service)
 
 
 @app.get("/")
