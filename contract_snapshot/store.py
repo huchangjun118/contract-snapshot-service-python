@@ -1,21 +1,31 @@
 """持久化存储：快照版本、基线指针、判定记录。
 
 设计要点：
-- SQLite 单文件存储，WAL 模式支持并发读写；
+- 默认使用进程工作目录下的单文件 SQLite 库（见 default_db_path），
+  重启进程后历史快照、基线与判定记录仍在；显式传入路径或设置
+  环境变量 CONTRACT_SNAPSHOT_DB 可覆盖，``:memory:`` 用于测试；
+- SQLite 单文件存储，文件库启用 WAL 支持并发读写；
 - 所有多步写入包在一个事务里，要么完整提交要么整体回滚，
   不会留下写了一半的中间产物；
 - 基线（baseline）是单行指针，更新与读取都是原子的，
   任一时刻读到的都是某个已提交的完整版本；
-- 读取基线按版本表主键查询，不随历史版本数量线性退化。
+- 判定记录独立成表：配置变更只影响之后写入的判定，
+  已落库的历史判定依据永不被改写。
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from .errors import ContractError, FailureKind
+
+# 未显式配置持久化位置时的默认落盘目录与文件名（相对工作目录）。
+DEFAULT_DATA_DIR = ".contract_snapshot"
+DEFAULT_DB_FILENAME = "contracts.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS versions (
@@ -38,7 +48,29 @@ CREATE TABLE IF NOT EXISTS seq (
     val INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO seq (id, val) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS judgments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint    TEXT NOT NULL,
+    version_id  TEXT NOT NULL REFERENCES versions(version_id),
+    baseline_version_id TEXT,
+    verdict     TEXT NOT NULL,
+    rules_match INTEGER NOT NULL,
+    created_seq INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_judgments_endpoint
+    ON judgments(endpoint, id);
 """
+
+
+def default_db_path(data_dir: str | os.PathLike[str] | None = None) -> str:
+    """返回默认落盘数据库路径：``$data_dir/contracts.db``。
+
+    data_dir 为 None 时使用工作目录下的 .contract_snapshot/，
+    也可由环境变量 CONTRACT_SNAPSHOT_DATA_DIR 覆盖。
+    """
+    base = data_dir or os.environ.get("CONTRACT_SNAPSHOT_DATA_DIR", DEFAULT_DATA_DIR)
+    return str(Path(base) / DEFAULT_DB_FILENAME)
 
 
 @dataclass(frozen=True)
@@ -53,23 +85,44 @@ class SnapshotRecord:
     created_seq: int
 
 
+@dataclass(frozen=True)
+class JudgmentRecord:
+    """一次采集的判定记录（落盘，配置变更不影响历史记录）。"""
+
+    endpoint: str
+    version_id: str
+    baseline_version_id: str | None
+    verdict: str
+    rules_match: bool
+    created_seq: int
+
+
 class SnapshotStore:
     """快照与基线的持久化存储。线程安全。"""
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self._lock = threading.RLock()
+        # 默认落盘：未显式传入时使用工作目录下的默认库，重启后数据仍在。
+        self._db_path = default_db_path() if db_path is None else db_path
         try:
-            # check_same_thread=False + 显式锁：多线程共享一个连接，
-            # 内存库在测试与并发场景下也能看到同一份数据。
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            if self._db_path != ":memory:":
+                parent = os.path.dirname(os.path.abspath(self._db_path))
+                os.makedirs(parent, exist_ok=True)
+            # check_same_thread=False + 显式锁：多线程共享一个连接。
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            if self._db_path != ":memory:":
+                self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             with self._conn:
                 self._conn.executescript(_SCHEMA)
-        except sqlite3.Error as exc:
+        except (OSError, sqlite3.Error) as exc:
             raise ContractError(
                 FailureKind.STORE_UNAVAILABLE, f"存储初始化失败: {exc}"
             ) from exc
+
+    @property
+    def db_path(self) -> str:
+        return self._db_path
 
     # ---- 内部工具 -------------------------------------------------
 
@@ -126,6 +179,55 @@ class SnapshotStore:
                 )
                 return SnapshotRecord(version_id, endpoint, schema,
                                       rules_fingerprint, False, seq)
+
+        return self._run(op)
+
+    # ---- 判定记录 -------------------------------------------------
+
+    def save_judgment(
+        self,
+        endpoint: str,
+        version_id: str,
+        baseline_version_id: str | None,
+        verdict: str,
+        rules_match: bool,
+        created_seq: int,
+    ) -> None:
+        """固化一次采集的判定依据。历史记录只追加，永不被配置变更改写。"""
+
+        def op() -> None:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO judgments"
+                    " (endpoint, version_id, baseline_version_id, verdict,"
+                    "  rules_match, created_seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (endpoint, version_id, baseline_version_id, verdict,
+                     1 if rules_match else 0, created_seq),
+                )
+
+        self._run(op)
+
+    def get_last_judgment(self, endpoint: str) -> JudgmentRecord | None:
+        """读取该接口最近一次采集判定；无记录返回 None。"""
+
+        def op() -> JudgmentRecord | None:
+            row = self._conn.execute(
+                "SELECT endpoint, version_id, baseline_version_id, verdict,"
+                " rules_match, created_seq FROM judgments"
+                " WHERE endpoint = ? ORDER BY id DESC LIMIT 1",
+                (endpoint,),
+            ).fetchone()
+            if row is None:
+                return None
+            return JudgmentRecord(
+                endpoint=row[0],
+                version_id=row[1],
+                baseline_version_id=row[2],
+                verdict=row[3],
+                rules_match=bool(row[4]),
+                created_seq=row[5],
+            )
 
         return self._run(op)
 

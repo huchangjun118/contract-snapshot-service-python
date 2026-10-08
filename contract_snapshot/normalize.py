@@ -3,6 +3,8 @@
 保证：
 - 字段顺序、无关空白不引起快照变化（字典按键排序、字符串去首尾空白）；
 - 时间戳、请求标识、分页游标等易变字段被替换为固定占位符；
+- ignore/volatile 规则按「嵌套路径 + 通配符」匹配深层字段，
+  而不是只能按字段名整体匹配；
 - 同一契约在不同时间、不同进程下采集得到同一份规范形式
   （不依赖哈希随机化、不依赖字典插入序、不依赖浮点表示差异）。
 """
@@ -12,7 +14,7 @@ import hashlib
 import json
 from typing import Any
 
-from .config import NormalizeRules
+from .config import NormalizeRules, PathMatcher
 
 # 易变字段归一化后的占位符
 _VOLATILE_PLACEHOLDER = "<volatile>"
@@ -21,25 +23,37 @@ _VOLATILE_PLACEHOLDER = "<volatile>"
 def normalize_payload(payload: Any, rules: NormalizeRules) -> Any:
     """将负载归一化为规范形式。
 
-    纯函数：相同输入在任何进程、任何时间得到相同输出。
+    纯函数：相同输入（含相同规则）在任何进程、任何时间得到相同输出。
     """
-    return _normalize(payload, rules)
+    ignore = PathMatcher(rules.ignore_paths)
+    volatile = PathMatcher(rules.volatile_paths)
+    return _normalize(payload, rules, ignore, volatile, ())
 
 
-def _normalize(value: Any, rules: NormalizeRules) -> Any:
+def _normalize(
+    value: Any,
+    rules: NormalizeRules,
+    ignore: PathMatcher,
+    volatile: PathMatcher,
+    path: tuple[str, ...],
+) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key in sorted(value.keys(), key=str):
             skey = str(key)
-            if skey in rules.ignore_paths:
-                continue  # 配置的忽略字段：完全不进入快照
-            if skey in rules.volatile_paths:
-                out[skey] = _VOLATILE_PLACEHOLDER  # 易变字段：保留结构、抹掉取值
+            child_path = path + (skey,)
+            if ignore.matches(child_path):
+                continue  # 配置的忽略路径：整棵子树不进入快照
+            if volatile.matches(child_path):
+                out[skey] = _VOLATILE_PLACEHOLDER  # 易变路径：保留结构、抹掉取值
                 continue
-            out[skey] = _normalize(value[key], rules)
+            out[skey] = _normalize(value[key], rules, ignore, volatile, child_path)
         return out
     if isinstance(value, (list, tuple)):
-        items = [_normalize(item, rules) for item in value]
+        # 数组元素沿用所在字段路径（数组下标不参与路径匹配）
+        items = [
+            _normalize(item, rules, ignore, volatile, path) for item in value
+        ]
         if rules.ignore_array_order:
             # 数组顺序不敏感：按各元素的规范序列化结果排序，
             # 保证不同顺序的同一集合得到同一规范形式。

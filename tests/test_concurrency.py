@@ -6,7 +6,7 @@ from contract_snapshot.store import SnapshotStore
 
 
 def _make_service():
-    return ContractService(SnapshotStore())
+    return ContractService(SnapshotStore(":memory:"))
 
 
 def test_concurrent_capture_consistent():

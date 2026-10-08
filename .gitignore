@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# 默认持久化落盘目录与 SQLite 临时文件
+.contract_snapshot/
+*.db-wal
+*.db-shm

@@ -12,6 +12,7 @@ class FailureKind(str, Enum):
     """失败类别，用于对外暴露可区分的状态。"""
 
     UNPARSEABLE_BODY = "unparseable_body"      # 请求/响应体无法解析
+    UNSUPPORTED_MEDIA_TYPE = "unsupported_media_type"  # 报文 Content-Type 不支持
     STORE_UNAVAILABLE = "store_unavailable"    # 存储暂时不可用
     VERSION_NOT_FOUND = "version_not_found"    # 目标版本不存在
     NOT_APPROVED = "not_approved"              # 版本尚未被批准
