@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from .config import NormalizeRules
+from .paths import matches_any
 
 # 易变字段归一化后的占位符
 _VOLATILE_PLACEHOLDER = "<volatile>"
@@ -23,23 +24,25 @@ def normalize_payload(payload: Any, rules: NormalizeRules) -> Any:
 
     纯函数：相同输入在任何进程、任何时间得到相同输出。
     """
-    return _normalize(payload, rules)
+    return _normalize(payload, rules, ())
 
 
-def _normalize(value: Any, rules: NormalizeRules) -> Any:
+def _normalize(value: Any, rules: NormalizeRules, path: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key in sorted(value.keys(), key=str):
             skey = str(key)
-            if skey in rules.ignore_paths:
-                continue  # 配置的忽略字段：完全不进入快照
-            if skey in rules.volatile_paths:
+            child = path + (skey,)
+            if matches_any(rules.ignore_paths, child):
+                continue  # 配置的忽略路径：完全不进入快照
+            if matches_any(rules.volatile_paths, child):
                 out[skey] = _VOLATILE_PLACEHOLDER  # 易变字段：保留结构、抹掉取值
                 continue
-            out[skey] = _normalize(value[key], rules)
+            out[skey] = _normalize(value[key], rules, child)
         return out
     if isinstance(value, (list, tuple)):
-        items = [_normalize(item, rules) for item in value]
+        # 数组不增加路径段：元素内字段的路径与父路径一致
+        items = [_normalize(item, rules, path) for item in value]
         if rules.ignore_array_order:
             # 数组顺序不敏感：按各元素的规范序列化结果排序，
             # 保证不同顺序的同一集合得到同一规范形式。

@@ -50,10 +50,39 @@ def test_config_change_does_not_reinterpret_history():
     svc2 = ContractService(svc._store, CaptureConfig(
         rules=NormalizeRules(ignore_paths=frozenset({"debug"}))
     ))
-    # 历史基线仍是原版本，规则指纹不同 -> 不重新解释历史，按兼容演进处理
-    r = svc2.capture_payload("/ep", {"id": 1})
+    # 候选仍带 debug 字段：按基线侧规则重新归一化后结构一致 -> 无变更。
+    # 历史基线不被重新解释，仍是原版本。
+    r = svc2.capture_payload("/ep", {"id": 1, "debug": True})
     assert svc2.get_baseline("/ep").version_id == v1
-    assert r.verdict.value in ("compatible", "identical")
+    assert r.verdict.value == "identical"
+
+
+def test_config_change_field_removal_still_breaking():
+    from contract_snapshot.config import CaptureConfig, NormalizeRules
+
+    svc = ContractService(SnapshotStore())
+    v1 = svc.capture_payload("/ep", {"id": 1, "debug": True}).version_id
+    svc.approve(v1)
+    # 配置变更（忽略 debug）不得掩盖真实的字段删除
+    svc2 = ContractService(svc._store, CaptureConfig(
+        rules=NormalizeRules(ignore_paths=frozenset({"debug"}))
+    ))
+    r = svc2.capture_payload("/ep", {"id": 1})  # debug 真的被删了
+    assert r.verdict.value == "breaking"
+    assert svc2.get_baseline("/ep").version_id == v1  # 基线不被污染
+
+
+def test_config_change_type_narrowing_still_breaking():
+    from contract_snapshot.config import CaptureConfig, NormalizeRules
+
+    svc = ContractService(SnapshotStore())
+    v1 = svc.capture_payload("/ep", {"v": 1.5}).version_id
+    svc.approve(v1)
+    svc2 = ContractService(svc._store, CaptureConfig(
+        rules=NormalizeRules(ignore_paths=frozenset({"other"}))
+    ))
+    r = svc2.capture_payload("/ep", {"v": 1})  # number -> integer 收紧
+    assert r.verdict.value == "breaking"
 
 
 def test_sampling_disabled_captures_nothing():

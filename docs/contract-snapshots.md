@@ -51,15 +51,81 @@
 
 ## 5. 配置项
 
-| 配置 | 默认 | 说明 |
-| --- | --- | --- |
-| `sampling_rate` | `1.0` | 采样率 `[0.0, 1.0]`，`0` 表示关闭采集 |
-| `rules.ignore_paths` | 空 | 完全不进入快照的字段名 |
-| `rules.volatile_paths` | 时间戳/请求标识/游标等 | 取值被抹除、结构保留的字段名 |
-| `rules.ignore_array_order` | `true` | 数组是否顺序不敏感 |
+### 5.1 配置来源与读取优先级
 
-每个版本落盘时记录**规则指纹**。配置变更后，历史基线不与新快照直接比较
-（按兼容演进处理），历史判定结果不会被重新解释。
+配置按以下优先级合并（高优先级覆盖低优先级）：
+
+1. **环境变量**（`CONTRACT_SNAPSHOT_*`）；
+2. **配置文件**（TOML；路径由 `CONTRACT_SNAPSHOT_CONFIG` 指定，
+   缺省查找当前目录的 `contract-snapshot.toml`）；
+3. **代码默认值**。
+
+| 配置 | 环境变量 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `sampling_rate` | `CONTRACT_SNAPSHOT_SAMPLING_RATE` | `1.0` | 采样率 `[0.0, 1.0]`，`0` 表示关闭采集 |
+| `include_endpoints` | `CONTRACT_SNAPSHOT_INCLUDE_ENDPOINTS` | 空（全部采集） | 采集范围，见 5.2 |
+| `db_path` | `CONTRACT_SNAPSHOT_DB` | `~/.contract-snapshot/snapshots.db` | 持久化位置，见 5.4 |
+| `rules.ignore_paths` | `CONTRACT_SNAPSHOT_IGNORE_PATHS` | 空 | 完全不进入快照的字段路径模式 |
+| `rules.volatile_paths` | `CONTRACT_SNAPSHOT_VOLATILE_PATHS` | 时间戳/请求标识/游标等 | 取值被抹除、结构保留的字段路径模式 |
+| `rules.ignore_array_order` | `CONTRACT_SNAPSHOT_IGNORE_ARRAY_ORDER` | `true` | 数组是否顺序不敏感 |
+
+环境变量中的列表值用逗号分隔。配置文件示例：
+
+```toml
+sampling_rate = 1.0
+include_endpoints = ["/api/*"]
+db_path = "/var/lib/contract-snapshot/snapshots.db"
+
+[rules]
+ignore_paths = ["data.*.debug"]
+volatile_paths = ["**.token", "timestamp"]
+ignore_array_order = true
+```
+
+### 5.2 采集范围
+
+`include_endpoints` 是 fnmatch 风格的接口路径模式列表（如 `/api/*`）：
+
+- 列表为空：采集全部接口；
+- 列表非空：只有命中任一模式的接口才会采集，**不在范围内的接口不产生
+  任何版本**，采集动作返回 `sampled=false` 且不写任何数据；
+- `sampling_rate=0` 关闭采集时同样返回 `sampled=false` 且不落盘。
+
+### 5.3 路径通配语法
+
+`ignore_paths` 与 `volatile_paths` 按**路径模式**匹配，而不是只按字段名：
+
+- 模式以 `.` 分段，从根开始锚定：`data.user.token` 只匹配根下
+  `data.user` 里的 `token`；
+- `*` 匹配恰好一层：`data.*.token` 匹配 `data` 下任意一层对象里的 `token`；
+- `**` 匹配任意层数（含零层）：`**.token` 匹配任意深度的 `token`；
+- 不含 `.` 的裸字段名（如 `debug`）匹配任意深度下的同名字段，
+  与早期按字段名整体匹配的行为兼容；
+- 数组不增加路径段：`{"items": [{"id": 1}]}` 中 `id` 的路径是 `items.id`。
+
+匹配是纯函数：同一份契约在不同时间、不同进程下采集得到可比较的
+同一份快照。
+
+### 5.4 持久化与重启
+
+快照版本与基线指针存储在 SQLite 单文件中（WAL 模式）。未显式配置
+`db_path` 时使用默认落盘位置 `~/.contract-snapshot/snapshots.db`
+（目录自动创建），**默认配置下重启服务后仍能查到重启前采集的版本与
+已批准的基线**。同一契约重启后再次采集得到同一个版本号，判定为
+`identical`。
+
+### 5.5 配置变更后的判定语义
+
+每个版本落盘时记录**规则指纹与规则本体**，已落库版本的判定依据不会被
+后续配置变更改写。配置变更后采集的候选与历史基线比较时：
+
+- 用**基线落库时记录的规则**重新归一化候选负载，再与基线 schema 比较；
+- 因此只要候选相对基线**删除了字段或收紧了类型**，无论采集侧配置怎么改，
+  判定结果仍然是 `breaking`，不会降级为 `compatible` 或 `identical`；
+- 历史判定结论不被重新解释，配置只影响之后的采集与判定。
+
+验证方法：`pytest tests/test_failures.py -k config_change` 覆盖了
+「配置变更后删除字段仍判破坏」「类型收紧仍判破坏」「历史基线不被改写」。
 
 ## 6. 失败状态
 
@@ -76,7 +142,10 @@
 
 ## 7. HTTP 接口
 
-- `POST /capture` `{endpoint, body}` → 采集并返回与基线的判定结论
+- `POST /capture` `{endpoint, body}` 或 `{endpoint, raw_body}` → 采集并返回
+  与基线的判定结论。`body` 是已解析的负载；`raw_body` 是原始报文文本，
+  由服务端解析，无法解析时返回 422 `unparseable_body`，该次采集不落盘、
+  不覆盖基线、不被记成无变更
 - `POST /approve` `{version_id}` → 批准并提升为基线
 - `POST /rollback` `{endpoint, version_id}` → 回滚基线
 - `GET /baseline/{endpoint}` → 查询当前基线

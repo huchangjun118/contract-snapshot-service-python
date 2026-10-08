@@ -61,3 +61,29 @@ def test_deterministic_across_calls():
 def test_float_integer_equivalence():
     rules = NormalizeRules()
     assert normalize_payload({"v": 1.0}, rules) == normalize_payload({"v": 1}, rules)
+
+
+def test_ignore_paths_nested_wildcard():
+    # 只忽略 data 下一层对象里的 debug，其他位置的 debug 保留
+    rules = NormalizeRules(ignore_paths=frozenset({"data.*.debug"}))
+    payload = {
+        "data": {"a": {"debug": 1, "keep": 1}},
+        "debug": "top-level-kept",
+    }
+    out = normalize_payload(payload, rules)
+    assert out == {"data": {"a": {"keep": 1}}, "debug": "top-level-kept"}
+
+
+def test_volatile_paths_deep_glob():
+    # ** 匹配任意深度：所有 token 字段都被抹掉
+    rules = NormalizeRules(volatile_paths=frozenset({"**.token"}))
+    a = {"user": {"token": "t1"}, "sessions": [{"token": "t2"}]}
+    b = {"user": {"token": "t9"}, "sessions": [{"token": "t8"}]}
+    assert normalize_payload(a, rules) == normalize_payload(b, rules)
+
+
+def test_array_elements_share_parent_path():
+    # 数组不增加路径段：items.id 命中数组元素内的 id
+    rules = NormalizeRules(ignore_paths=frozenset({"items.id"}))
+    payload = {"items": [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}]}
+    assert normalize_payload(payload, rules) == {"items": [{"v": "a"}, {"v": "b"}]}

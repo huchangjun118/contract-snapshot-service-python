@@ -31,7 +31,8 @@ _STATUS = {
 
 class CaptureRequest(BaseModel):
     endpoint: str
-    body: Any  # 已解析的请求/响应负载
+    body: Any = None       # 已解析的请求/响应负载
+    raw_body: str | None = None  # 原始报文（未解析的文本），与 body 二选一
 
 
 class VersionRequest(BaseModel):
@@ -55,7 +56,16 @@ def create_app(service: ContractService) -> FastAPI:
 
     @app.post("/capture")
     def capture(req: CaptureRequest) -> dict:
-        result = service.capture_payload(req.endpoint, req.body)
+        if req.raw_body is not None:
+            # 原始报文：解析失败抛 UNPARSEABLE_BODY(422)，不落盘、不污染基线
+            result = service.capture(req.endpoint, req.raw_body)
+        elif req.body is not None:
+            result = service.capture_payload(req.endpoint, req.body)
+        else:
+            raise ContractError(
+                FailureKind.UNPARSEABLE_BODY,
+                "必须提供 body（已解析负载）或 raw_body（原始报文）之一",
+            )
         return {
             "endpoint": result.endpoint,
             "version_id": result.version_id,

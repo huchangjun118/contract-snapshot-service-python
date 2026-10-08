@@ -1,14 +1,14 @@
-import os
-
+"""服务入口：配置来自环境与配置文件，默认落盘、跨重启保留数据。"""
 import uvicorn
 
 from contract_snapshot.api import create_app
-from contract_snapshot.config import CaptureConfig
+from contract_snapshot.config import load_config
 from contract_snapshot.service import ContractService
 from contract_snapshot.store import SnapshotStore
 
-store = SnapshotStore(os.environ.get("CONTRACT_SNAPSHOT_DB", ":memory:"))
-service = ContractService(store, CaptureConfig())
+config = load_config()
+store = SnapshotStore(config.resolved_db_path())
+service = ContractService(store, config)
 app = create_app(service)
 
 

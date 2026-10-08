@@ -15,6 +15,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 
+from .config import NormalizeRules
 from .errors import ContractError, FailureKind
 
 _SCHEMA = """
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS versions (
     endpoint     TEXT NOT NULL,
     schema_json  TEXT NOT NULL,
     rules_fingerprint TEXT NOT NULL,
+    rules_json   TEXT NOT NULL DEFAULT '',
     approved     INTEGER NOT NULL DEFAULT 0,
     created_seq  INTEGER NOT NULL
 );
@@ -43,12 +45,17 @@ INSERT OR IGNORE INTO seq (id, val) VALUES (1, 0);
 
 @dataclass(frozen=True)
 class SnapshotRecord:
-    """一条已固化的快照版本。"""
+    """一条已固化的快照版本。
+
+    rules 是生成该快照时使用的归一化规则本体，随版本一起落库：
+    之后配置怎么改，都不会改写这条记录的判定依据。
+    """
 
     version_id: str
     endpoint: str
     schema: dict
     rules_fingerprint: str
+    rules: NormalizeRules
     approved: bool
     created_seq: int
 
@@ -59,6 +66,11 @@ class SnapshotStore:
     def __init__(self, db_path: str = ":memory:") -> None:
         self._lock = threading.RLock()
         try:
+            if db_path != ":memory:":
+                # 确保落盘目录存在，默认位置也能直接可用
+                from pathlib import Path
+
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             # check_same_thread=False + 显式锁：多线程共享一个连接，
             # 内存库在测试与并发场景下也能看到同一份数据。
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -66,6 +78,18 @@ class SnapshotStore:
             self._conn.execute("PRAGMA foreign_keys=ON")
             with self._conn:
                 self._conn.executescript(_SCHEMA)
+                # 兼容旧库：已存在的 versions 表可能缺少 rules_json 列
+                cols = {
+                    r[1]
+                    for r in self._conn.execute(
+                        "PRAGMA table_info(versions)"
+                    ).fetchall()
+                }
+                if "rules_json" not in cols:
+                    self._conn.execute(
+                        "ALTER TABLE versions"
+                        " ADD COLUMN rules_json TEXT NOT NULL DEFAULT ''"
+                    )
         except sqlite3.Error as exc:
             raise ContractError(
                 FailureKind.STORE_UNAVAILABLE, f"存储初始化失败: {exc}"
@@ -87,13 +111,20 @@ class SnapshotStore:
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row | tuple) -> SnapshotRecord:
+        rules_json = row[4]
+        rules = (
+            NormalizeRules.from_dict(json.loads(rules_json))
+            if rules_json
+            else NormalizeRules()  # 旧记录无规则本体：按默认规则还原
+        )
         return SnapshotRecord(
             version_id=row[0],
             endpoint=row[1],
             schema=json.loads(row[2]),
             rules_fingerprint=row[3],
-            approved=bool(row[4]),
-            created_seq=row[5],
+            rules=rules,
+            approved=bool(row[5]),
+            created_seq=row[6],
         )
 
     # ---- 版本写入 -------------------------------------------------
@@ -104,8 +135,12 @@ class SnapshotStore:
         endpoint: str,
         schema: dict,
         rules_fingerprint: str,
+        rules: NormalizeRules,
     ) -> SnapshotRecord:
-        """保存一个未批准的快照版本（幂等：同 version_id 重复写入返回已有记录）。"""
+        """保存一个未批准的快照版本（幂等：同 version_id 重复写入返回已有记录）。
+
+        规则本体随版本落库，之后的配置变更不会改写该版本的判定依据。
+        """
 
         def op() -> SnapshotRecord:
             with self._conn:  # 事务：序号分配与版本插入同生共死
@@ -117,15 +152,17 @@ class SnapshotStore:
                 seq = self._conn.execute(
                     "UPDATE seq SET val = val + 1 WHERE id = 1 RETURNING val"
                 ).fetchone()[0]
+                rules_json = json.dumps(rules.to_dict(), sort_keys=True)
                 self._conn.execute(
                     "INSERT INTO versions"
-                    " (version_id, endpoint, schema_json, rules_fingerprint, approved, created_seq)"
-                    " VALUES (?, ?, ?, ?, 0, ?)",
+                    " (version_id, endpoint, schema_json, rules_fingerprint,"
+                    " rules_json, approved, created_seq)"
+                    " VALUES (?, ?, ?, ?, ?, 0, ?)",
                     (version_id, endpoint, json.dumps(schema, sort_keys=True),
-                     rules_fingerprint, seq),
+                     rules_fingerprint, rules_json, seq),
                 )
                 return SnapshotRecord(version_id, endpoint, schema,
-                                      rules_fingerprint, False, seq)
+                                      rules_fingerprint, rules, False, seq)
 
         return self._run(op)
 

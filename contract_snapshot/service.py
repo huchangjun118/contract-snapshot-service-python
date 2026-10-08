@@ -52,7 +52,14 @@ class ContractService:
         return self.capture_payload(endpoint, payload)
 
     def capture_payload(self, endpoint: str, payload: Any) -> CaptureResult:
-        """从已解析的负载采集（供测试与内部复用）。"""
+        """从已解析的负载采集（供测试与内部复用）。
+
+        接口不在采集范围或采样未命中时返回 sampled=False，不写任何数据。
+        """
+        if not self._config.endpoint_in_scope(endpoint):
+            baseline = self._store.get_baseline(endpoint)
+            return CaptureResult(endpoint, "", Verdict.IDENTICAL,
+                                 baseline.version_id if baseline else None, False)
         if not self._sampled():
             baseline = self._store.get_baseline(endpoint)
             return CaptureResult(endpoint, "", Verdict.IDENTICAL,
@@ -70,11 +77,13 @@ class ContractService:
         ).hexdigest()[:16]
         version_id = f"{endpoint}:{schema_hash}:{fp}"
 
-        record = self._store.save_version(version_id, endpoint, schema, fp)
+        record = self._store.save_version(
+            version_id, endpoint, schema, fp, self._config.rules
+        )
         return CaptureResult(
             endpoint=endpoint,
             version_id=record.version_id,
-            verdict=self._judge_against_baseline(endpoint, schema, fp),
+            verdict=self._judge_against_baseline(endpoint, payload, schema, fp),
             baseline_version_id=(b.version_id if (b := self._store.get_baseline(endpoint)) else None),
             sampled=True,
         )
@@ -120,16 +129,22 @@ class ContractService:
     # ---- 内部 -------------------------------------------------
 
     def _judge_against_baseline(
-        self, endpoint: str, schema: dict, rules_fingerprint: str
+        self, endpoint: str, payload: Any, schema: dict, rules_fingerprint: str
     ) -> Verdict:
-        """与当前基线比较。规则指纹不一致时按当前配置重新提取基线侧不可比，
-        视为兼容演进（不重新解释历史判定，只影响新判定）。"""
+        """与当前基线比较。
+
+        规则指纹不一致（配置已变更）时，用基线落库时记录的规则重新归一化
+        候选负载再比较：删除字段、收紧类型仍然判破坏，不会因为配置与基线
+        不是同一套规则就降级为兼容。历史版本的判定依据（落库的规则与
+        schema）不被改写。
+        """
         baseline = self._store.get_baseline(endpoint)
         if baseline is None:
             return Verdict.IDENTICAL  # 首个版本：无基线可比，记为无变更
         if baseline.rules_fingerprint != rules_fingerprint:
-            # 配置已变更：历史基线不与新快照直接比较，避免重新解释历史
-            return Verdict.COMPATIBLE
+            # 配置已变更：按基线侧规则重新归一化候选，保证可比性
+            rebased = extract_schema(normalize_payload(payload, baseline.rules))
+            return compare_schemas(baseline.schema, rebased)
         return compare_schemas(baseline.schema, schema)
 
     def _sampled(self) -> bool:
